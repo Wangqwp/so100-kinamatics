@@ -1,0 +1,13 @@
+# Runtime dependencies of the SO-101 kinematics module (so100_kinematics.py).
+#
+# The module is deliberately dependency-light: `numpy` is the only
+# third-party import, everything else comes from the standard library
+# (`math`, `os`, `dataclasses`, `typing`, `xml.etree`).
+#
+# It has to stay installable inside the ROS Python (3.10), therefore there
+# is no torch / scipy / lerobot here - those are only needed by the
+# `kinematics_utils` backend of LeRobot, which this module replaces.
+#
+#   python -m pip install -r requirements.txt
+
+numpy>=1.21,<3.0
