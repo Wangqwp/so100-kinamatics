@@ -23,7 +23,7 @@ class TopicRelay(Node):
         # 阈值，单位与 /so100/joint_states 里 gripper 的数值一致。
         # 该话题发布的是归一化值（0..100），不是弧度，所以不能再把
         # 阈值换算成弧度去比较（8deg -> 0.14 会让任何读数都算“闭合”）。
-        self.declare_parameter('gripper_threshold', 15.0)
+        self.declare_parameter('gripper_threshold', 10.0)
 
         # gripper 数值「大」还是「小」代表闭合：
         #   high -> 数值变大即闭合（默认；例如 0 张开、100 闭合）
@@ -134,9 +134,9 @@ class TopicRelay(Node):
         # 节点就会在启动后立刻锁定，而且夹爪张开后仍然判定为闭合，
         # 永远无法退出锁定状态。
         if self.gripper_closed_when == 'low':
-            current_state = abs(gripper_angle) <= self.gripper_threshold
+            current_state = gripper_angle <= self.gripper_threshold
         else:
-            current_state = abs(gripper_angle) >= self.gripper_threshold
+            current_state = gripper_angle >= self.gripper_threshold
 
         # 候选状态发生变化，重新开始计时
         if current_state != self.pending_state:
