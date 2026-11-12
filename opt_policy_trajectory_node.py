@@ -4,11 +4,36 @@
 
 节点订阅 VLM/策略模型输出的 action chunk
 （``trajectory_msgs/JointTrajectory``：``joint_names`` 给出关节名，``points``
-里的每个点是一步预测并自带 ``time_from_start``），对每个点调用
-:mod:`utils.kinematics_utils` 的 FK（``SO100KinematicsUtils.forward_kinematics``）
-解算末端执行器（``gripper_frame_link``）的位姿，并把整条 chunk 作为一条
-``nav_msgs/Path`` 发布 —— 每个预测点一个 ``geometry_msgs/PoseStamped``，
-时间戳是 chunk 的基准时间加上该点的 ``time_from_start``。
+里的每个点是一步预测并自带 ``time_from_start``），**先把整条 chunk 的关节
+位置平滑掉**，再对每个点调用 :mod:`utils.kinematics_utils` 的 FK
+（``SO100KinematicsUtils.forward_kinematics``）解算末端执行器
+（``gripper_frame_link``）的位姿，并把整条 chunk 作为一条 ``nav_msgs/Path``
+发布 —— 每个预测点一个 ``geometry_msgs/PoseStamped``，时间戳是 chunk 的基准
+时间加上该点的 ``time_from_start``。
+
+平滑
+----
+策略模型输出的关节位置往往带抖动，直接解 FK 会让末端轨迹抖得很厉害。
+本节点在 FK **之前**沿时间轴把五个手臂关节的位置滤一遍（夹爪不在运动链上，
+保持原值），平滑的点数和顺序都不变，所以时间戳也不变。
+
+``smooth_method`` 参数选择滤波方法（见 :mod:`utils.trajectory_smoothing`）：
+
+``savgol``（默认）
+    Savitzky-Golay 滤波：局部最小二乘拟合低阶多项式，压抖动但保住形状。
+``moving_average``
+    居中的滑动平均。
+``gaussian``
+    高斯核滤波。
+``median``
+    中值滤波，对孤立尖峰最有效。
+``none``
+    不平滑。
+
+``smooth_window`` 是滤波窗口的点数，``smooth_polyorder`` 是 Savitzky-Golay
+的多项式阶数，``smooth_sigma`` 是高斯滤波的标准差。chunk 的
+``time_from_start`` 间隔不均匀时，节点会先把关节轨迹重采样到均匀的时间
+网格上，滤完再插值回原来的时间点。
 
 单位
 ----
@@ -38,9 +63,9 @@ FK 走的是 LeRobot 的运动学后端（需要 ``lerobot`` 与 ``placo``），
 
     source /opt/ros/humble/setup.bash
     conda activate lerobot_ros2
-    python3 policy_trajectory_node.py
+    python3 opt_policy_trajectory_node.py
     # 带参数：
-    python3 policy_trajectory_node.py --ros-args -p action_unit:=deg
+    python3 opt_policy_trajectory_node.py --ros-args -p action_unit:=deg
 """
 
 from __future__ import annotations
@@ -48,7 +73,7 @@ from __future__ import annotations
 import os
 import sys
 import time
-from typing import Dict, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -83,12 +108,30 @@ from utils.kinematics_utils import (  # noqa: E402
     DEFAULT_URDF_PATH,
     SO100KinematicsUtils,
 )
+from utils.trajectory_smoothing import (  # noqa: E402
+    SMOOTH_METHOD_NONE,
+    SMOOTH_METHOD_SAVGOL,
+    normalize_smooth_method,
+    smooth_joint_positions,
+)
 
 #: 订阅 action chunk 的默认话题。
 DEFAULT_ACTION_CHUNK_TOPIC = "/so100/policy/action_chunk"
 
 #: 发布 EE 位姿轨迹的默认话题。
-DEFAULT_EE_TRAJECTORY_TOPIC = "/so100/ee_trajectory"
+DEFAULT_EE_TRAJECTORY_TOPIC = "/so100/policy/opt_ee_trajectory"
+
+#: 默认的平滑方法：Savitzky-Golay（压抖动但保住轨迹的形状）。
+DEFAULT_SMOOTH_METHOD = SMOOTH_METHOD_SAVGOL
+
+#: 默认的滤波窗口长度（点数）。
+DEFAULT_SMOOTH_WINDOW = 7
+
+#: 默认的 Savitzky-Golay 多项式阶数。
+DEFAULT_SMOOTH_POLYORDER = 2
+
+#: 默认的高斯滤波标准差（点）。
+DEFAULT_SMOOTH_SIGMA = 1.0
 
 #: 发布位姿所用的坐标系（SO-101 的 URDF 里 ``base_link`` 就是根 link）。
 DEFAULT_BASE_FRAME = "base_link"
@@ -136,6 +179,12 @@ class PolicyTrajectoryNode(Node):
         self.declare_parameter("calibration_path", DEFAULT_CALIBRATION_PATH)
         self.declare_parameter("gripper_joint_name", GRIPPER_JOINT_NAME)
 
+        # 平滑：FK 之前先把关节位置滤一遍（夹爪不动）。
+        self.declare_parameter("smooth_method", DEFAULT_SMOOTH_METHOD)
+        self.declare_parameter("smooth_window", DEFAULT_SMOOTH_WINDOW)
+        self.declare_parameter("smooth_polyorder", DEFAULT_SMOOTH_POLYORDER)
+        self.declare_parameter("smooth_sigma", DEFAULT_SMOOTH_SIGMA)
+
         self._action_chunk_topic = str(self.get_parameter("action_chunk_topic").value)
         self._ee_trajectory_topic = str(self.get_parameter("ee_trajectory_topic").value)
         self._base_frame = str(self.get_parameter("base_frame").value).strip()
@@ -143,6 +192,19 @@ class PolicyTrajectoryNode(Node):
             str(self.get_parameter("gripper_joint_name").value).strip()
             or GRIPPER_JOINT_NAME
         )
+
+        try:
+            self._smooth_method = normalize_smooth_method(
+                str(self.get_parameter("smooth_method").value)
+            )
+        except ValueError as exc:
+            self.get_logger().warn(f"{exc} —— 不做平滑")
+            self._smooth_method = SMOOTH_METHOD_NONE
+        self._smooth_window = max(1, int(self.get_parameter("smooth_window").value))
+        self._smooth_polyorder = max(
+            0, int(self.get_parameter("smooth_polyorder").value)
+        )
+        self._smooth_sigma = float(self.get_parameter("smooth_sigma").value)
 
         try:
             self._unit = normalize_joint_unit(str(self.get_parameter("action_unit").value))
@@ -212,7 +274,13 @@ class PolicyTrajectoryNode(Node):
 
         self.get_logger().info(
             f"订阅 {self._action_chunk_topic}（关节单位：{self._unit}），"
-            f"发布 {self._ee_trajectory_topic}（坐标系：{self._pose_frame}）"
+            f"发布 {self._ee_trajectory_topic}（坐标系：{self._pose_frame}），"
+            f"平滑：{self._smooth_method}"
+            + (
+                f"，窗口 {self._smooth_window} 点"
+                if self._smooth_method != SMOOTH_METHOD_NONE
+                else ""
+            )
         )
 
     # ------------------------------------------------------------------
@@ -227,7 +295,7 @@ class PolicyTrajectoryNode(Node):
     # 回调
     # ------------------------------------------------------------------
     def _on_action_chunk(self, msg: JointTrajectory) -> None:
-        """把一个 action chunk 解算成 EE 位姿轨迹并发布。"""
+        """把一个 action chunk 平滑后解算成 EE 位姿轨迹并发布。"""
         names = [str(name) for name in msg.joint_names]
         if not names:
             self._warn_throttled("action chunk 没有给出关节名，本次不发布轨迹")
@@ -241,27 +309,50 @@ class PolicyTrajectoryNode(Node):
             )
             return
 
+        # 先把整条 chunk 的关节位置收齐（原始单位）—— 平滑要整条一起做。
+        positions: List[List[float]] = []
+        for point in msg.points:
+            values = list(point.positions)
+            if not self._has_positions(values, indices):
+                self._warn_throttled(
+                    "action chunk 里的某个预测点缺少关节值，本次不发布轨迹"
+                )
+                return
+            positions.append(values)
+
+        if not positions:
+            self._warn_throttled("action chunk 里的关节值无法解读，本次不发布轨迹")
+            return
+
+        # 平滑：五个手臂关节沿时间轴滤一遍，然后才解 FK。
+        smoothed = self._smooth_positions(positions, msg.points, indices)
+
+        # ``auto`` 模式下，整条 chunk 用同一个单位：第一个点的数值决定它。
+        # 单位是按**原始**数值判断的 —— 平滑过的值不再是整数的伺服计数，
+        # 用它们判断会把归一化值误认成弧度。
+        chunk_unit = self._unit
+        if chunk_unit == JOINT_UNIT_AUTO:
+            chunk_unit = self._detect_unit(
+                {
+                    joint: float(positions[0][indices[joint]])
+                    for joint in ARM_JOINT_NAMES
+                }
+            )
+
         base_stamp = self._stamp(msg)
         path = Path()
         path.header.frame_id = self._pose_frame
         path.header.stamp = base_stamp
 
-        # ``auto`` 模式下，整条 chunk 用同一个单位：第一个点的数值决定它。
-        chunk_unit = self._unit
+        for index, point in enumerate(msg.points):
+            values = {
+                joint: float(smoothed[index, column])
+                for column, joint in enumerate(ARM_JOINT_NAMES)
+            }
 
-        for point in msg.points:
-            positions = list(point.positions)
-            if not self._has_positions(positions, indices):
-                self._warn_throttled(
-                    "action chunk 里的某个预测点缺少关节值，本次不发布轨迹"
-                )
-                return
-
-            values = self._point_values(positions, indices)
-            if chunk_unit == JOINT_UNIT_AUTO:
-                chunk_unit = self._detect_unit(values)
-
-            pose = self._point_pose(values, positions, indices, chunk_unit, base_stamp, point)
+            pose = self._point_pose(
+                values, positions[index], indices, chunk_unit, base_stamp, point
+            )
             if pose is not None:
                 path.poses.append(pose)
 
@@ -270,13 +361,58 @@ class PolicyTrajectoryNode(Node):
             return
 
         self._publisher.publish(path)
-        print("msg.points: ", msg.points)
-        print("\n")
-        print("path: ", path)
-        print("\n")
         self.get_logger().debug(
             f"发布了 {len(path.poses)} 个 EE 位姿到 {self._ee_trajectory_topic}"
         )
+
+    # ------------------------------------------------------------------
+    # 平滑
+    # ------------------------------------------------------------------
+    def _smooth_positions(
+        self,
+        positions: Sequence[Sequence[float]],
+        points: Sequence[JointTrajectoryPoint],
+        indices: Dict[str, int],
+    ) -> np.ndarray:
+        """整条 chunk 的手臂关节位置（原始单位）沿时间轴平滑。
+
+        返回 ``(N, len(ARM_JOINT_NAMES))`` 的矩阵，列的顺序和
+        ``ARM_JOINT_NAMES`` 一致。没有平滑时返回的也是同样的形状（调用方
+        不需要区分）。
+
+        夹爪不在运动链上（不影响末端位姿），所以只平滑手臂关节。
+        """
+        count = len(positions)
+        raw = np.empty((count, len(ARM_JOINT_NAMES)), dtype=np.float64)
+        for index, values in enumerate(positions):
+            for column, joint in enumerate(ARM_JOINT_NAMES):
+                raw[index, column] = float(values[indices[joint]])
+
+        if self._smooth_method == SMOOTH_METHOD_NONE or count < 2:
+            return raw
+
+        # 时间轴：chunk 的 ``time_from_start``（秒）。间隔不均匀时，平滑
+        # 模块会先把关节轨迹重采样到均匀的时间网格上，滤完再插值回来。
+        times = [self._point_time(point) for point in points]
+
+        try:
+            return smooth_joint_positions(
+                raw,
+                times=times,
+                method=self._smooth_method,
+                window=self._smooth_window,
+                polyorder=self._smooth_polyorder,
+                sigma=self._smooth_sigma,
+            )
+        except ValueError as exc:
+            self._warn_throttled(f"轨迹平滑失败：{exc} —— 使用未平滑的关节值")
+            return raw
+
+    @staticmethod
+    def _point_time(point: JointTrajectoryPoint) -> float:
+        """预测点离 chunk 起点有多远（秒）。"""
+        duration = point.time_from_start
+        return int(duration.sec) + int(duration.nanosec) * 1e-9
 
     # ------------------------------------------------------------------
     # 关节名 -> 下标
@@ -313,12 +449,6 @@ class PolicyTrajectoryNode(Node):
     ) -> bool:
         """这个预测点里的关节值够不够（手臂关节必须齐全）。"""
         return all(indices[joint] < len(positions) for joint in ARM_JOINT_NAMES)
-
-    def _point_values(
-        self, positions: Sequence[float], indices: Dict[str, int]
-    ) -> Dict[str, float]:
-        """一个预测点里手臂关节的原始值（按键名索引）。"""
-        return {joint: float(positions[indices[joint]]) for joint in ARM_JOINT_NAMES}
 
     def _point_pose(
         self,
