@@ -194,6 +194,10 @@ class So101PoseNode(Node):
     def _on_joint_states(self, msg: JointState) -> None:
         """解算并发布末端位姿。"""
         action = self._joint_action(msg)
+        #TODO： 临时的action joint修正
+        action['shoulder_pan.pos'] *= 0.9
+        action['shoulder_lift.pos'] -= 5.0
+        action['elbow_flex.pos'] -= 5.0
         if action is None:
             return
 
