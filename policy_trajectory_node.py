@@ -88,7 +88,7 @@ from utils.kinematics_utils import (  # noqa: E402
 DEFAULT_ACTION_CHUNK_TOPIC = "/so100/policy/action_chunk"
 
 #: 发布 EE 位姿轨迹的默认话题。
-DEFAULT_EE_TRAJECTORY_TOPIC = "/so100/ee_trajectory"
+DEFAULT_EE_TRAJECTORY_TOPIC = "/so100/policy/ee_trajectory"
 
 #: 发布位姿所用的坐标系（SO-101 的 URDF 里 ``base_link`` 就是根 link）。
 DEFAULT_BASE_FRAME = "base_link"
@@ -270,10 +270,6 @@ class PolicyTrajectoryNode(Node):
             return
 
         self._publisher.publish(path)
-        print("msg.points: ", msg.points)
-        print("\n")
-        print("path: ", path)
-        print("\n")
         self.get_logger().debug(
             f"发布了 {len(path.poses)} 个 EE 位姿到 {self._ee_trajectory_topic}"
         )

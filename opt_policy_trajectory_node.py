@@ -313,6 +313,10 @@ class PolicyTrajectoryNode(Node):
         positions: List[List[float]] = []
         for point in msg.points:
             values = list(point.positions)
+            # TODO: 临时的action joint修正
+            values[0] *= 0.9
+            values[1] -= 5.0
+            values[2] -= 5.0
             if not self._has_positions(values, indices):
                 self._warn_throttled(
                     "action chunk 里的某个预测点缺少关节值，本次不发布轨迹"
