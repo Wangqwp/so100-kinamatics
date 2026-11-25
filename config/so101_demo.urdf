@@ -1,0 +1,53 @@
+<?xml version="1.0"?>
+<!-- Minimal SO-101-like chain used by the demo publisher. Replace it with
+     the calibrated URDF of your own robot for real experiments. -->
+<robot name="so101_demo">
+  <link name="base_link"/>
+  <link name="shoulder_pan_link"/>
+  <link name="shoulder_lift_link"/>
+  <link name="elbow_flex_link"/>
+  <link name="wrist_flex_link"/>
+  <link name="wrist_roll_link"/>
+  <link name="gripper_frame_link"/>
+
+  <joint name="shoulder_pan" type="revolute">
+    <parent link="base_link"/>
+    <child link="shoulder_pan_link"/>
+    <origin xyz="0 0 0.050" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.9" upper="2.9" effort="10" velocity="10"/>
+  </joint>
+  <joint name="shoulder_lift" type="revolute">
+    <parent link="shoulder_pan_link"/>
+    <child link="shoulder_lift_link"/>
+    <origin xyz="0 0 0.095" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.9" upper="1.9" effort="10" velocity="10"/>
+  </joint>
+  <joint name="elbow_flex" type="revolute">
+    <parent link="shoulder_lift_link"/>
+    <child link="elbow_flex_link"/>
+    <origin xyz="0 0 0.105" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.9" upper="1.9" effort="10" velocity="10"/>
+  </joint>
+  <joint name="wrist_flex" type="revolute">
+    <parent link="elbow_flex_link"/>
+    <child link="wrist_flex_link"/>
+    <origin xyz="0 0 0.095" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.9" upper="1.9" effort="10" velocity="10"/>
+  </joint>
+  <joint name="wrist_roll" type="revolute">
+    <parent link="wrist_flex_link"/>
+    <child link="wrist_roll_link"/>
+    <origin xyz="0 0 0.055" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-2.85" upper="2.85" effort="10" velocity="10"/>
+  </joint>
+  <joint name="gripper_frame" type="fixed">
+    <parent link="wrist_roll_link"/>
+    <child link="gripper_frame_link"/>
+    <origin xyz="0 0 0.050" rpy="0 0 0"/>
+  </joint>
+</robot>

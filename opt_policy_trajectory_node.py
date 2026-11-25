@@ -5,8 +5,8 @@
 节点订阅 VLM/策略模型输出的 action chunk
 （``trajectory_msgs/JointTrajectory``：``joint_names`` 给出关节名，``points``
 里的每个点是一步预测并自带 ``time_from_start``），**先把整条 chunk 的关节
-位置平滑掉**，再对每个点调用 :mod:`utils.kinematics_utils` 的 FK
-（``SO100KinematicsUtils.forward_kinematics``）解算末端执行器
+位置平滑掉**，再对每个点调用 :mod:`temp.so100_kinematics` 的纯 numpy FK
+（``So100Kinematics.forward_kinematics``）解算末端执行器
 （``gripper_frame_link``）的位姿，并把整条 chunk 作为一条 ``nav_msgs/Path``
 发布 —— 每个预测点一个 ``geometry_msgs/PoseStamped``，时间戳是 chunk 的基准
 时间加上该点的 ``time_from_start``。
@@ -58,11 +58,11 @@ action chunk 里的关节值默认是**归一化值**（手臂关节 -100..100�
 
 运行环境
 --------
-FK 走的是 LeRobot 的运动学后端（需要 ``lerobot`` 与 ``placo``），所以节点要
-跑在同时具备 ROS 2 与 LeRobot 的环境里，例如::
+FK 走仓库根目录的纯 numpy 运动学（``so100_kinematics.py``，经
+``temp.so100_kinematics`` 兼容层接入），只依赖 ROS 2 与 numpy，不需要
+``lerobot`` / ``placo``::
 
     source /opt/ros/humble/setup.bash
-    conda activate lerobot_ros2
     python3 opt_policy_trajectory_node.py
     # 带参数：
     python3 opt_policy_trajectory_node.py --ros-args -p action_unit:=deg
@@ -94,6 +94,8 @@ if _REPO_ROOT not in sys.path:
 from temp.so100_kinematics import (  # noqa: E402  (上面的 sys.path 调整必须先执行)
     ARM_JOINT_NAMES,
     DEFAULT_CALIBRATION_PATH,
+    DEFAULT_TARGET_FRAME,
+    DEFAULT_URDF_PATH,
     JOINT_UNIT_AUTO,
     JOINT_UNIT_NORM,
     KinematicsError,
@@ -102,11 +104,6 @@ from temp.so100_kinematics import (  # noqa: E402  (上面的 sys.path 调整必
     matrix_to_quaternion,
     normalize_joint_unit,
     rotvec_to_matrix,
-)
-from utils.kinematics_utils import (  # noqa: E402
-    DEFAULT_TARGET_FRAME,
-    DEFAULT_URDF_PATH,
-    SO100KinematicsUtils,
 )
 from utils.trajectory_smoothing import (  # noqa: E402
     SMOOTH_METHOD_NONE,
@@ -220,44 +217,27 @@ class PolicyTrajectoryNode(Node):
         if calibration_path:
             try:
                 self._calibration = load_joint_calibration(calibration_path)
-            except KinematicsError as exc:
+            except (KinematicsError, OSError) as exc:
                 self.get_logger().warn(f"{exc} —— 归一化的关节值无法换算成角度")
 
         # ------------------------------------------------------------------
-        # 运动学
+        # 运动学（纯 numpy，直接算到 base_frame）
         # ------------------------------------------------------------------
         urdf_path = str(self.get_parameter("urdf_path").value)
         target_frame = str(self.get_parameter("target_frame").value)
 
-        # URDF 里的限位、根 link 等信息（用来判断单位是否设错，以及位姿的
-        # 参考系）。纯 numpy 实现，不依赖 placo，所以即使 FK 起不来也可用。
         try:
             self._urdf = So100Kinematics(
                 urdf_path=urdf_path,
                 target_frame=target_frame,
                 joint_names=ARM_JOINT_NAMES,
                 calibration=self._calibration,
+                base_frame=self._base_frame or None,
             )
-        except KinematicsError as exc:
+        except (KinematicsError, OSError) as exc:
             self.get_logger().fatal(f"URDF 无法读取：{exc}")
             raise
         self._root_frame = self._urdf.root_frame
-
-        self._kinematics = SO100KinematicsUtils(
-            motor_names=list(ARM_JOINT_NAMES),
-            urdf_path=urdf_path,
-            target_frame_name=target_frame,
-        )
-        #: placo 的机器人模型，用来把位姿搬到 ``base_frame`` 里。
-        self._robot = self._kinematics.kinematics.robot
-
-        if self._base_frame and self._base_frame not in set(self._robot.frame_names()):
-            self.get_logger().fatal(
-                f"base_frame {self._base_frame!r} 不是 URDF {urdf_path!r} 里的坐标系"
-            )
-            raise ValueError(
-                f"base_frame {self._base_frame!r} is not a frame of the URDF"
-            )
 
         # ------------------------------------------------------------------
         # ROS 接口
@@ -313,10 +293,11 @@ class PolicyTrajectoryNode(Node):
         positions: List[List[float]] = []
         for point in msg.points:
             values = list(point.positions)
-            # TODO: 临时的action joint修正
-            values[0] *= 0.9
-            values[1] -= 5.0
-            values[2] -= 5.0
+            if len(values) >= 3:
+                # TODO: 临时的action joint修正
+                values[0] *= 0.9
+                values[1] -= 5.0
+                values[2] -= 5.0
             if not self._has_positions(values, indices):
                 self._warn_throttled(
                     "action chunk 里的某个预测点缺少关节值，本次不发布轨迹"
@@ -484,36 +465,24 @@ class PolicyTrajectoryNode(Node):
         action[f"{self._gripper_joint_name}.pos"] = self._gripper_value(positions, indices)
 
         try:
-            ee_pose = self._kinematics.forward_kinematics(action)
+            # FK 已经在构造 So100Kinematics 时指定了 base_frame，
+            # 不需要再借 placo 的 get_T_world_frame 做二次变换。
+            ee_pose = self._urdf.forward_kinematics(action)
         except Exception as exc:  # noqa: BLE001 —— FK 失败不能带崩节点
             self._warn_throttled(f"正向运动学解算失败：{exc}")
             return None
 
-        transform = np.eye(4, dtype=np.float64)
-        transform[:3, :3] = rotvec_to_matrix(
+        rotation = rotvec_to_matrix(
             [ee_pose["ee.wx"], ee_pose["ee.wy"], ee_pose["ee.wz"]]
         )
-        transform[:3, 3] = [
-            ee_pose["ee.x"],
-            ee_pose["ee.y"],
-            ee_pose["ee.z"],
-        ]
-
-        if self._base_frame and self._base_frame != self._root_frame:
-            # FK 的结果在 URDF 的根坐标系里，搬到 base_frame 里。
-            world_to_base = np.asarray(
-                self._robot.get_T_world_frame(self._base_frame), dtype=np.float64
-            )
-            transform = np.linalg.inv(world_to_base) @ transform
-
-        x, y, z, w = matrix_to_quaternion(transform[:3, :3])
+        x, y, z, w = matrix_to_quaternion(rotation)
 
         pose = PoseStamped()
         pose.header.frame_id = self._pose_frame
         pose.header.stamp = add_duration(base_stamp, point.time_from_start)
-        pose.pose.position.x = float(transform[0, 3])
-        pose.pose.position.y = float(transform[1, 3])
-        pose.pose.position.z = float(transform[2, 3])
+        pose.pose.position.x = float(ee_pose["ee.x"])
+        pose.pose.position.y = float(ee_pose["ee.y"])
+        pose.pose.position.z = float(ee_pose["ee.z"])
         pose.pose.orientation.x = x
         pose.pose.orientation.y = y
         pose.pose.orientation.z = z
